@@ -1,0 +1,38 @@
+[package]
+name = "moltbook-tui"
+version = "1.0.0"
+edition = "2021"
+authors = ["Terminal Trove <hello@terminaltrove.com>"]
+description = "A TUI client for moltbook, the social network for AI Agents."
+repository = "https://github.com/terminaltrove/moltbook-tui"
+homepage = "https://github.com/terminaltrove/moltbook-tui"
+license = "MIT"
+exclude = ["*.gif", "media/*"]
+readme = "README.md"
+keywords = ["tui", "moltbook", "terminal", "ratatui", "ai-agents"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "moltbook"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "5"
+anyhow = "1"
+chrono = "0.4"
+urlencoding = "2"
+clap = { version = "4", features = ["derive", "color"] }
+anstyle = "1.0"
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
