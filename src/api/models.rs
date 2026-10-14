@@ -35,9 +35,14 @@ pub struct SubmoltFull {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Stats {
+    // `/stats` names these `totalAgents` etc.; `/homepage`'s `stats` uses the bare names.
+    #[serde(alias = "totalAgents")]
     pub agents: u64,
+    #[serde(alias = "totalSubmolts")]
     pub submolts: u64,
+    #[serde(alias = "totalPosts")]
     pub posts: u64,
+    #[serde(alias = "totalComments")]
     pub comments: u64,
 }
 
@@ -54,6 +59,8 @@ pub struct LeaderboardAgent {
     pub karma: i64,
     pub is_claimed: bool,
     pub avatar_url: Option<String>,
+    // The karma-sorted agent list carries no rank; `get_leaderboard` numbers it.
+    #[serde(default)]
     pub rank: u32,
     pub owner: Option<AgentOwner>,
 }
@@ -86,6 +93,7 @@ pub struct AgentProfile {
     pub karma: i64,
     pub follower_count: i64,
     pub following_count: i64,
+    #[serde(alias = "posts_count")]
     pub post_count: Option<i64>,
     pub created_at: String,
     pub is_claimed: bool,
@@ -105,6 +113,8 @@ pub struct AgentProfileResponse {
 pub struct Post {
     pub id: String,
     pub title: String,
+    // A profile's `recentPosts` carry only a `content_preview`.
+    #[serde(alias = "content_preview")]
     pub content: Option<String>,
     pub url: Option<String>,
     pub upvotes: i64,
@@ -144,21 +154,31 @@ impl Comment {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PostsResponse {
     pub posts: Vec<Post>,
+    #[serde(default)]
+    pub has_more: bool,
+    // Paging is by cursor; `offset` is accepted and ignored. Random sort returns none.
+    #[serde(default)]
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PostDetailResponse {
+pub struct PostResponse {
     pub post: Post,
-    pub comments: Vec<Comment>,
 }
 
+// `/posts/{id}` no longer embeds comments; they come from `/posts/{id}/comments`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommentsResponse {
     pub comments: Vec<Comment>,
+    #[serde(default)]
+    pub has_more: bool,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LeaderboardResponse {
+    #[serde(alias = "agents")]
     pub leaderboard: Vec<LeaderboardAgent>,
 }
 
@@ -187,10 +207,101 @@ pub struct TopHuman {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HomepageResponse {
-    pub success: bool,
-    #[serde(rename = "topHumans")]
-    pub top_humans: Vec<TopHuman>,
+pub struct TopHumansResponse {
+    // `/agents/top-humans` says `humans`; `/homepage` embeds the same list as `topHumans`.
+    #[serde(alias = "topHumans")]
+    pub humans: Vec<TopHuman>,
+}
+
+/// What `/search` looks through. The site's own selector offers exactly these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SearchType {
+    #[default]
+    All,
+    Posts,
+    Comments,
+    Agents,
+    Submolts,
+}
+
+impl SearchType {
+    pub const ALL: [SearchType; 5] = [
+        SearchType::All,
+        SearchType::Posts,
+        SearchType::Comments,
+        SearchType::Agents,
+        SearchType::Submolts,
+    ];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SearchType::All => "all",
+            SearchType::Posts => "posts",
+            SearchType::Comments => "comments",
+            SearchType::Agents => "agents",
+            SearchType::Submolts => "submolts",
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            SearchType::All => "All",
+            SearchType::Posts => "Posts",
+            SearchType::Comments => "Comments",
+            SearchType::Agents => "Agents",
+            SearchType::Submolts => "Submolts",
+        }
+    }
+
+    pub fn cycle_next(&self) -> Self {
+        let i = Self::ALL.iter().position(|t| t == self).unwrap_or(0);
+        Self::ALL[(i + 1) % Self::ALL.len()]
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchAuthor {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchPostRef {
+    pub id: String,
+    pub title: Option<String>,
+}
+
+/// One hit from `/search`. Every kind shares this shape and says which it is in
+/// `kind`: a post or comment has `post_id`, an agent its name in `title`, a submolt
+/// its name in `submolt` and its subscriber count in `upvotes`. `content` is a
+/// snippet with matches wrapped in `⟦HL⟧…⟦/HL⟧`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchResult {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub title: Option<String>,
+    pub content: Option<String>,
+    #[serde(default)]
+    pub upvotes: i64,
+    #[serde(default)]
+    pub downvotes: i64,
+    pub created_at: Option<String>,
+    pub author: Option<SearchAuthor>,
+    pub submolt: Option<Submolt>,
+    pub post: Option<SearchPostRef>,
+    #[serde(default)]
+    pub post_id: String,
+    /// The hit's page on the site, e.g. `/post/{id}` or `/u/{name}`.
+    pub url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchResponse {
+    pub results: Vec<SearchResult>,
+    #[serde(default)]
+    pub has_more: bool,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -256,5 +367,82 @@ impl std::fmt::Display for TimeFilter {
             TimeFilter::Year => write!(f, "Year"),
             TimeFilter::All => write!(f, "All"),
         }
+    }
+}
+
+// Real responses from moltbook.com, trimmed to one item per list. When the API
+// changes shape again, these say which endpoint and which field.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse<T: serde::de::DeserializeOwned>(json: &str) -> T {
+        serde_json::from_str(json).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    #[test]
+    fn posts_page_carries_a_cursor() {
+        let r: PostsResponse = parse(include_str!("fixtures/posts.json"));
+        assert!(!r.posts.is_empty());
+        assert!(r.has_more);
+        assert!(r.next_cursor.is_some());
+    }
+
+    #[test]
+    fn comments_arrive_threaded() {
+        let r: CommentsResponse = parse(include_str!("fixtures/comments.json"));
+        assert!(!r.comments[0].replies.is_empty());
+        assert_eq!(r.comments[0].replies[0].depth, 1);
+    }
+
+    #[test]
+    fn stats_read_the_total_names() {
+        let s: Stats = parse(include_str!("fixtures/stats.json"));
+        assert!(s.agents > 0 && s.posts > 0);
+    }
+
+    #[test]
+    fn search_results_of_every_kind() {
+        let r: SearchResponse = parse(include_str!("fixtures/search.json"));
+        let kinds: Vec<&str> = r.results.iter().map(|x| x.kind.as_str()).collect();
+        assert_eq!(kinds, ["post", "comment", "agent", "submolt"]);
+        assert!(r.results.iter().all(|x| x.content.is_some()));
+    }
+
+    #[test]
+    fn a_single_post() {
+        let r: PostResponse = parse(include_str!("fixtures/post.json"));
+        assert!(r.post.content.is_some());
+    }
+
+    #[test]
+    fn top_humans() {
+        let r: TopHumansResponse = parse(include_str!("fixtures/top_humans.json"));
+        assert!(r.humans[0].rank > 0);
+    }
+
+    #[test]
+    fn leaderboard_reads_the_karma_sorted_agent_list() {
+        let r: LeaderboardResponse = parse(include_str!("fixtures/leaderboard.json"));
+        assert!(!r.leaderboard.is_empty());
+    }
+
+    #[test]
+    fn recent_agents() {
+        let r: RecentAgentsResponse = parse(include_str!("fixtures/recent_agents.json"));
+        assert!(!r.agents.is_empty());
+    }
+
+    #[test]
+    fn agent_profile_with_post_previews() {
+        let r: AgentProfileResponse = parse(include_str!("fixtures/agent_profile.json"));
+        assert!(r.agent.post_count.is_some());
+        assert!(r.recent_posts.iter().all(|p| p.content.is_some()));
+    }
+
+    #[test]
+    fn submolts() {
+        let r: SubmoltsResponse = parse(include_str!("fixtures/submolts.json"));
+        assert!(!r.submolts.is_empty());
     }
 }

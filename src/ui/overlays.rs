@@ -46,13 +46,27 @@ pub fn render_spinner(frame: &mut Frame, app: &App) {
     frame.render_widget(spinner_widget, popup_area);
 }
 
+/// Rows the help popup takes, borders included. `help_lines` must fit inside it.
+const HELP_HEIGHT: u16 = 29;
+
 pub fn render_help(frame: &mut Frame) {
     let area = frame.area();
-    let popup_area = centered_fixed_rect(45, 26, area);
+    let popup_area = centered_fixed_rect(45, HELP_HEIGHT, area);
 
     frame.render_widget(Clear, popup_area);
 
-    let help_text = vec![
+    let help_widget = Paragraph::new(help_lines()).block(
+        Block::default()
+            .title(" Help ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(MOLTBOOK_RED)),
+    );
+
+    frame.render_widget(help_widget, popup_area);
+}
+
+fn help_lines() -> Vec<Line<'static>> {
+    vec![
         Line::from(Span::styled(
             "Keybindings",
             Style::default()
@@ -82,6 +96,7 @@ pub fn render_help(frame: &mut Frame) {
         Line::from("  N         Next page"),
         Line::from("  P         Previous page"),
         Line::from("  1-8       Navigate screens"),
+        Line::from("  /         Search"),
         Line::from("  `         Toggle debug panel"),
         Line::from("  ?         Toggle help"),
         Line::from("  q         Quit"),
@@ -90,16 +105,7 @@ pub fn render_help(frame: &mut Frame) {
             "Press ? to close",
             Style::default().fg(Color::DarkGray),
         )),
-    ];
-
-    let help_widget = Paragraph::new(help_text).block(
-        Block::default()
-            .title(" Help ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(MOLTBOOK_RED)),
-    );
-
-    frame.render_widget(help_widget, popup_area);
+    ]
 }
 
 pub fn render_error(frame: &mut Frame, app: &App) {
@@ -497,4 +503,28 @@ pub fn render_about(frame: &mut Frame) {
         );
 
     frame.render_widget(about_widget, popup_area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_help_popup_is_tall_enough_for_every_line() {
+        // It was 26 rows for 28 rows of content, so "Press ? to close" never showed.
+        let needed = help_lines().len() as u16 + 2;
+        assert!(
+            needed <= HELP_HEIGHT,
+            "help needs {needed} rows, has {HELP_HEIGHT}"
+        );
+    }
+
+    #[test]
+    fn the_help_lists_search() {
+        let text: Vec<String> = help_lines().iter().map(|l| l.to_string()).collect();
+        assert!(
+            text.iter().any(|l| l.contains('/') && l.contains("Search")),
+            "{text:#?}"
+        );
+    }
 }

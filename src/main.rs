@@ -5,7 +5,7 @@ mod mouse;
 mod ui;
 
 use anyhow::Result;
-use api::TimeFilter;
+use api::{SearchType, TimeFilter};
 use app::{App, Screen};
 use clap::{builder::Styles, Parser};
 use crossterm::{
@@ -80,12 +80,14 @@ fn open_url(url: &str) {
     }
 }
 const POSTS_LIMIT: i64 = 25;
+/// Top-level comments to read per post; replies come nested and are not counted.
+const MAX_COMMENTS: usize = 500;
 
 #[derive(Debug)]
 enum AppEvent {
     Input(KeyCode),
-    MouseClick(u16, u16), // (x, y) coordinates
-    PostsLoaded(Vec<api::Post>, bool), // (posts, has_more)
+    MouseClick(u16, u16),                              // (x, y) coordinates
+    PostsLoaded(Vec<api::Post>, bool, Option<String>), // (posts, has_more, next_cursor)
     CommentsLoaded(Vec<api::Comment>),
     StatsLoaded(api::Stats),
     LeaderboardLoaded(Vec<api::LeaderboardAgent>),
@@ -94,6 +96,15 @@ enum AppEvent {
     SubmoltsLoaded(Vec<api::SubmoltFull>),
     AgentProfileLoaded(api::AgentProfileResponse),
     AgentPreviewLoaded(api::AgentProfileResponse), // Preview update (keeps sidebar open)
+    PostLoaded(api::Post),
+    SearchLoaded {
+        query: String,
+        kind: SearchType,
+        results: Vec<api::SearchResult>,
+        has_more: bool,
+        next_cursor: Option<String>,
+        append: bool,
+    },
     ConfigSaved(Result<config::Config, String>),
     Error(String),
     Debug(String),
@@ -108,7 +119,7 @@ async fn main() -> Result<()> {
     // Load config - always succeeds, api_key may be None
     let config = config::Config::load().unwrap_or_else(|_| config::Config {
         api_key: None,
-        api_url: "https://www.moltbook.com/api/v1".to_string(),
+        api_url: "https://moltbook.com/api/v1".to_string(),
         row_display: config::RowDisplay::default(),
         refresh_interval_secs: 10,
     });
@@ -224,7 +235,7 @@ async fn main() -> Result<()> {
         api_client.clone(),
         app.sort_order,
         app.time_filter_for_api(),
-        0,
+        None,
         None,
         tx.clone(),
     );
@@ -249,11 +260,12 @@ async fn main() -> Result<()> {
                 AppEvent::MouseClick(x, y) => {
                     mouse::handle_mouse_click(&mut app, x, y, api_client.clone(), tx.clone());
                 }
-                AppEvent::PostsLoaded(posts, has_more) => {
+                AppEvent::PostsLoaded(posts, has_more, next_cursor) => {
                     app.is_loading = false;
                     app.is_background_loading = false;
                     app.error_message = None;
-                    app.has_more_posts = has_more;
+                    app.has_more_posts = has_more && next_cursor.is_some();
+                    app.record_next_cursor(next_cursor);
                     app.update_posts(posts);
                 }
                 AppEvent::CommentsLoaded(comments) => {
@@ -327,7 +339,7 @@ async fn main() -> Result<()> {
                                 api_client.clone(),
                                 app.sort_order,
                                 app.time_filter_for_api(),
-                                0,
+                                None,
                                 app.current_submolt.as_ref().map(|s| s.name.clone()),
                                 tx.clone(),
                             );
@@ -336,6 +348,33 @@ async fn main() -> Result<()> {
                         Err(e) => {
                             app.setup_error = Some(e);
                         }
+                    }
+                }
+                AppEvent::PostLoaded(post) => {
+                    // Only if the reader is still on the post this was fetched for.
+                    if app.current_post.as_ref().map(|p| &p.id) == Some(&post.id) {
+                        app.current_post = Some(post);
+                    }
+                }
+                AppEvent::SearchLoaded {
+                    query,
+                    kind,
+                    results,
+                    has_more,
+                    next_cursor,
+                    append,
+                } => {
+                    app.is_loading = false;
+                    app.is_background_loading = false;
+                    if app.apply_search_results(
+                        &query,
+                        kind,
+                        results,
+                        has_more,
+                        next_cursor,
+                        append,
+                    ) {
+                        app.error_message = None;
                     }
                 }
                 AppEvent::Error(msg) => {
@@ -353,12 +392,12 @@ async fn main() -> Result<()> {
                     if app.screen == Screen::Feed && !app.is_loading && should_refresh {
                         app.is_loading = true;
                         app.is_background_loading = true;
-                        let offset = app.current_page as i64 * POSTS_LIMIT;
+                        let cursor = app.page_cursor();
                         load_posts(
                             api_client.clone(),
                             app.sort_order,
                             app.time_filter_for_api(),
-                            offset,
+                            cursor,
                             app.current_submolt.as_ref().map(|s| s.name.clone()),
                             tx.clone(),
                         );
@@ -506,12 +545,12 @@ fn handle_input(
                     app.error_message = None;
                     app.show_technical_error = false;
                     app.is_loading = true;
-                    let offset = app.current_page as i64 * POSTS_LIMIT;
+                    let cursor = app.page_cursor();
                     load_posts(
                         api_client.clone(),
                         app.sort_order,
                         app.time_filter_for_api(),
-                        offset,
+                        cursor,
                         app.current_submolt.as_ref().map(|s| s.name.clone()),
                         tx.clone(),
                     );
@@ -526,9 +565,44 @@ fn handle_input(
         return;
     }
 
+    // Typing a search query: every key goes into the query until Enter or Esc, so
+    // letters that are shortcuts elsewhere (q, n, j...) can be searched for.
+    if app.screen == Screen::Search && app.search_editing {
+        match key {
+            KeyCode::Char(c) => app.search_query.push(c),
+            KeyCode::Backspace => {
+                app.search_query.pop();
+            }
+            KeyCode::Enter => run_search(app, api_client, tx),
+            KeyCode::Tab => {
+                app.search_type = app.search_type.cycle_next();
+                if app.search_submitted.is_some() {
+                    run_search(app, api_client, tx);
+                    app.search_editing = true;
+                }
+            }
+            KeyCode::Down => {
+                if !app.search_results.is_empty() {
+                    app.search_editing = false;
+                }
+            }
+            KeyCode::Esc => {
+                app.search_editing = false;
+                if app.search_submitted.is_none() && app.search_query.is_empty() {
+                    app.go_back();
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+
     match key {
         KeyCode::Char('q') => {
             app.should_quit = true;
+        }
+        KeyCode::Char('/') => {
+            app.open_search();
         }
         KeyCode::Char('?') => {
             app.toggle_help();
@@ -545,15 +619,19 @@ fn handle_input(
             {
                 app.next_page();
                 app.is_loading = true;
-                let offset = app.current_page as i64 * POSTS_LIMIT;
+                let cursor = app.page_cursor();
                 load_posts(
                     api_client.clone(),
                     app.sort_order,
                     app.time_filter_for_api(),
-                    offset,
+                    cursor,
                     app.current_submolt.as_ref().map(|s| s.name.clone()),
                     tx.clone(),
                 );
+            }
+            // Reaching the last search result fetches the next page beneath it.
+            if app.screen == Screen::Search && app.search_selected + 1 >= app.search_results.len() {
+                load_more_search(app, api_client.clone(), tx.clone());
             }
             // Update agent preview if sidebar is open
             if app.show_agent_preview {
@@ -572,12 +650,12 @@ fn handle_input(
             {
                 app.prev_page();
                 app.is_loading = true;
-                let offset = app.current_page as i64 * POSTS_LIMIT;
+                let cursor = app.page_cursor();
                 load_posts(
                     api_client.clone(),
                     app.sort_order,
                     app.time_filter_for_api(),
-                    offset,
+                    cursor,
                     app.current_submolt.as_ref().map(|s| s.name.clone()),
                     tx.clone(),
                 );
@@ -627,6 +705,12 @@ fn handle_input(
                         app.is_loading = true;
                         app.is_preview_loading = true;
                         load_agent_preview(api_client.clone(), human.bot_name.clone(), tx.clone());
+                    }
+                }
+                Screen::Search => {
+                    app.search_type = app.search_type.cycle_next();
+                    if app.search_submitted.is_some() {
+                        run_search(app, api_client.clone(), tx.clone());
                     }
                 }
                 Screen::RecentAgents => {
@@ -697,6 +781,8 @@ fn handle_input(
                     app.is_loading = true;
                     load_post_with_comments(api_client, post_id, tx);
                 }
+            } else if app.screen == Screen::Search {
+                open_search_hit(app, api_client, tx);
             } else if app.screen == Screen::Submolts {
                 // Load posts from selected submolt
                 if !app.submolts.is_empty() {
@@ -710,7 +796,7 @@ fn handle_input(
                         api_client,
                         app.sort_order,
                         app.time_filter_for_api(),
-                        0,
+                        None,
                         Some(submolt.name),
                         tx,
                     );
@@ -725,12 +811,12 @@ fn handle_input(
                 match app.screen {
                     Screen::Feed => {
                         app.is_loading = true;
-                        let offset = app.current_page as i64 * POSTS_LIMIT;
+                        let cursor = app.page_cursor();
                         load_posts(
                             api_client,
                             app.sort_order,
                             app.time_filter_for_api(),
-                            offset,
+                            cursor,
                             app.current_submolt.as_ref().map(|s| s.name.clone()),
                             tx,
                         );
@@ -761,6 +847,12 @@ fn handle_input(
                             load_agent_profile(api_client, profile.name.clone(), tx);
                         }
                     }
+                    Screen::Search => {
+                        if let Some(query) = app.search_submitted.clone() {
+                            app.search_query = query;
+                            run_search(app, api_client, tx);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -771,7 +863,7 @@ fn handle_input(
                 app.set_sort_order(api::SortOrder::New);
                 app.current_page = 0;
                 app.is_loading = true;
-                load_posts(api_client, app.sort_order, app.time_filter_for_api(), 0, app.current_submolt.as_ref().map(|s| s.name.clone()), tx);
+                load_posts(api_client, app.sort_order, app.time_filter_for_api(), None, app.current_submolt.as_ref().map(|s| s.name.clone()), tx);
             }
         }
         KeyCode::Char('t') => {
@@ -779,7 +871,7 @@ fn handle_input(
                 app.set_sort_order(api::SortOrder::Top);
                 app.current_page = 0;
                 app.is_loading = true;
-                load_posts(api_client, app.sort_order, app.time_filter_for_api(), 0, app.current_submolt.as_ref().map(|s| s.name.clone()), tx);
+                load_posts(api_client, app.sort_order, app.time_filter_for_api(), None, app.current_submolt.as_ref().map(|s| s.name.clone()), tx);
             }
         }
         KeyCode::Char('d') => {
@@ -787,7 +879,7 @@ fn handle_input(
                 app.set_sort_order(api::SortOrder::Discussed);
                 app.current_page = 0;
                 app.is_loading = true;
-                load_posts(api_client, app.sort_order, app.time_filter_for_api(), 0, app.current_submolt.as_ref().map(|s| s.name.clone()), tx);
+                load_posts(api_client, app.sort_order, app.time_filter_for_api(), None, app.current_submolt.as_ref().map(|s| s.name.clone()), tx);
             }
         }
         KeyCode::Char('R') => {
@@ -795,7 +887,7 @@ fn handle_input(
                 app.set_sort_order(api::SortOrder::Random);
                 app.current_page = 0;
                 app.is_loading = true;
-                load_posts(api_client, app.sort_order, app.time_filter_for_api(), 0, app.current_submolt.as_ref().map(|s| s.name.clone()), tx);
+                load_posts(api_client, app.sort_order, app.time_filter_for_api(), None, app.current_submolt.as_ref().map(|s| s.name.clone()), tx);
             }
         }
         KeyCode::Char('f') | KeyCode::Right => {
@@ -810,7 +902,7 @@ fn handle_input(
                 app.cycle_time_filter();
                 app.current_page = 0;
                 app.is_loading = true;
-                load_posts(api_client, app.sort_order, app.time_filter_for_api(), 0, app.current_submolt.as_ref().map(|s| s.name.clone()), tx);
+                load_posts(api_client, app.sort_order, app.time_filter_for_api(), None, app.current_submolt.as_ref().map(|s| s.name.clone()), tx);
             }
         }
         KeyCode::Left => {
@@ -825,7 +917,7 @@ fn handle_input(
                 app.cycle_time_filter_reverse();
                 app.current_page = 0;
                 app.is_loading = true;
-                load_posts(api_client, app.sort_order, app.time_filter_for_api(), 0, app.current_submolt.as_ref().map(|s| s.name.clone()), tx);
+                load_posts(api_client, app.sort_order, app.time_filter_for_api(), None, app.current_submolt.as_ref().map(|s| s.name.clone()), tx);
             }
         }
         // 's' for shuffle (switch to random sort with fresh seed)
@@ -834,20 +926,22 @@ fn handle_input(
                 app.set_sort_order(api::SortOrder::Random);
                 app.current_page = 0;
                 app.is_loading = true;
-                load_posts(api_client, app.sort_order, app.time_filter_for_api(), 0, app.current_submolt.as_ref().map(|s| s.name.clone()), tx);
+                load_posts(api_client, app.sort_order, app.time_filter_for_api(), None, app.current_submolt.as_ref().map(|s| s.name.clone()), tx);
             }
         }
         // Page navigation (capital N/P)
         KeyCode::Char('N') => {
-            if app.screen == Screen::Feed && !app.is_loading && app.has_more_posts {
+            if app.screen == Screen::Search {
+                load_more_search(app, api_client, tx);
+            } else if app.screen == Screen::Feed && !app.is_loading && app.has_more_posts {
                 app.next_page();
                 app.is_loading = true;
-                let offset = app.current_page as i64 * POSTS_LIMIT;
+                let cursor = app.page_cursor();
                 load_posts(
                     api_client,
                     app.sort_order,
                     app.time_filter_for_api(),
-                    offset,
+                    cursor,
                     app.current_submolt.as_ref().map(|s| s.name.clone()),
                     tx,
                 );
@@ -857,12 +951,12 @@ fn handle_input(
             if app.screen == Screen::Feed && !app.is_loading && app.current_page > 0 {
                 app.prev_page();
                 app.is_loading = true;
-                let offset = app.current_page as i64 * POSTS_LIMIT;
+                let cursor = app.page_cursor();
                 load_posts(
                     api_client,
                     app.sort_order,
                     app.time_filter_for_api(),
-                    offset,
+                    cursor,
                     app.current_submolt.as_ref().map(|s| s.name.clone()),
                     tx,
                 );
@@ -920,39 +1014,8 @@ fn handle_input(
             app.toggle_about();
         }
         KeyCode::Char('o') => {
-            let base = "https://www.moltbook.com";
-            match &app.screen {
-                Screen::Feed => {
-                    if let Some(post) = app.posts.get(app.selected_index) {
-                        open_url(&format!("{}/posts/{}", base, post.id));
-                    }
-                }
-                Screen::PostDetail => {
-                    if let Some(post) = &app.current_post {
-                        open_url(&format!("{}/posts/{}", base, post.id));
-                    }
-                }
-                Screen::AgentProfile => {
-                    if let Some(profile) = &app.agent_profile {
-                        open_url(&format!("{}/agent/{}", base, profile.name));
-                    }
-                }
-                Screen::Submolts => {
-                    if let Some(submolt) = app.submolts.get(app.submolts_selected) {
-                        open_url(&format!("{}/s/{}", base, submolt.name));
-                    }
-                }
-                Screen::Leaderboard => {
-                    if let Some(agent) = app.leaderboard.get(app.leaderboard_selected) {
-                        open_url(&format!("{}/agent/{}", base, agent.name));
-                    }
-                }
-                Screen::RecentAgents => {
-                    if let Some(agent) = app.recent_agents.get(app.recent_selected) {
-                        open_url(&format!("{}/agent/{}", base, agent.name));
-                    }
-                }
-                _ => {}
+            if let Some(path) = app.web_path() {
+                open_url(&format!("https://www.moltbook.com{}", path));
             }
         }
         // Refresh interval adjustment
@@ -989,7 +1052,7 @@ fn load_posts(
     api_client: Arc<api::ApiClient>,
     sort: api::SortOrder,
     time_filter: Option<TimeFilter>,
-    offset: i64,
+    cursor: Option<String>,
     submolt: Option<String>,
     tx: mpsc::Sender<AppEvent>,
 ) {
@@ -997,12 +1060,18 @@ fn load_posts(
         let submolt_str = submolt.as_deref();
         let _ = tx
             .send(AppEvent::Debug(format!(
-                "GET /posts?sort={:?}&time={:?}&offset={}&submolt={:?}",
-                sort, time_filter, offset, submolt_str
+                "GET /posts?sort={:?}&time={:?}&cursor={:?}&submolt={:?}",
+                sort, time_filter, cursor, submolt_str
             )))
             .await;
         match api_client
-            .get_posts(sort, time_filter, POSTS_LIMIT, offset, submolt_str)
+            .get_posts(
+                sort,
+                time_filter,
+                POSTS_LIMIT,
+                cursor.as_deref(),
+                submolt_str,
+            )
             .await
         {
             Ok(response) => {
@@ -1026,14 +1095,160 @@ fn load_posts(
                         response.posts.len()
                     )))
                     .await;
-                let has_more = response.posts.len() as i64 == POSTS_LIMIT;
                 let _ = tx
-                    .send(AppEvent::PostsLoaded(response.posts, has_more))
+                    .send(AppEvent::PostsLoaded(
+                        response.posts,
+                        response.has_more,
+                        response.next_cursor,
+                    ))
                     .await;
             }
             Err(e) => {
                 let _ = tx
                     .send(AppEvent::Error(format!("Failed to load posts: {}", e)))
+                    .await;
+            }
+        }
+    });
+}
+
+/// Start a fresh search for whatever is in the query box.
+fn run_search(app: &mut App, api_client: Arc<api::ApiClient>, tx: mpsc::Sender<AppEvent>) {
+    if let Some(query) = app.begin_search() {
+        app.is_loading = true;
+        load_search(api_client, query, app.search_type, None, tx);
+    }
+}
+
+/// Append the next page of the current search, if there is one and none is on its way.
+fn load_more_search(app: &mut App, api_client: Arc<api::ApiClient>, tx: mpsc::Sender<AppEvent>) {
+    if app.is_loading || !app.search_has_more {
+        return;
+    }
+    if let (Some(query), Some(cursor)) = (app.search_submitted.clone(), app.search_cursor.clone()) {
+        app.is_loading = true;
+        app.is_background_loading = true; // no modal spinner over the list being read
+        load_search(api_client, query, app.search_type, Some(cursor), tx);
+    }
+}
+
+fn load_search(
+    api_client: Arc<api::ApiClient>,
+    query: String,
+    kind: SearchType,
+    cursor: Option<String>,
+    tx: mpsc::Sender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let append = cursor.is_some();
+        let _ = tx
+            .send(AppEvent::Debug(format!(
+                "GET /search?q={}&type={}{}",
+                query,
+                kind.as_str(),
+                if append { "&cursor=…" } else { "" }
+            )))
+            .await;
+        match api_client.search(&query, kind, cursor.as_deref()).await {
+            Ok(response) => {
+                let _ = tx
+                    .send(AppEvent::Debug(format!(
+                        "OK: {} search results",
+                        response.results.len()
+                    )))
+                    .await;
+                let _ = tx
+                    .send(AppEvent::SearchLoaded {
+                        query,
+                        kind,
+                        results: response.results,
+                        has_more: response.has_more,
+                        next_cursor: response.next_cursor,
+                        append,
+                    })
+                    .await;
+            }
+            Err(e) => {
+                let _ = tx
+                    .send(AppEvent::Error(format!("Search failed: {}", e)))
+                    .await;
+            }
+        }
+    });
+}
+
+/// Open whatever the selected search result is: a post (or the post a comment is
+/// on) with its comments, an agent's profile, or a submolt's feed.
+fn open_search_hit(app: &mut App, api_client: Arc<api::ApiClient>, tx: mpsc::Sender<AppEvent>) {
+    let Some(hit) = app.selected_search_result().cloned() else {
+        return;
+    };
+    match hit.kind.as_str() {
+        "post" | "comment" => {
+            app.open_search_post(&hit);
+            let post_id = app
+                .current_post
+                .as_ref()
+                .map(|p| p.id.clone())
+                .unwrap_or_default();
+            app.is_loading = true;
+            load_post_with_comments(api_client.clone(), post_id.clone(), tx.clone());
+            load_post(api_client, post_id, tx);
+        }
+        "agent" => {
+            let name = hit
+                .title
+                .clone()
+                .or_else(|| hit.author.as_ref().map(|a| a.name.clone()));
+            if let Some(name) = name {
+                app.previous_screen = Some(Screen::Search);
+                app.screen = Screen::AgentProfile;
+                app.is_loading = true;
+                load_agent_profile(api_client, name, tx);
+            }
+        }
+        "submolt" => {
+            if let Some(submolt) = hit.submolt.clone() {
+                app.current_submolt = Some(api::SubmoltFull {
+                    id: submolt.id.unwrap_or(hit.id),
+                    display_name: submolt.display_name.unwrap_or_else(|| submolt.name.clone()),
+                    name: submolt.name.clone(),
+                    description: hit.content.as_deref().map(ui::utils::strip_highlights),
+                    subscriber_count: hit.upvotes,
+                    created_at: hit.created_at.unwrap_or_default(),
+                    last_activity_at: None,
+                    featured_at: None,
+                    created_by: None,
+                });
+                app.screen = Screen::Feed;
+                app.current_page = 0;
+                app.selected_index = 0;
+                app.is_loading = true;
+                load_posts(
+                    api_client,
+                    app.sort_order,
+                    app.time_filter_for_api(),
+                    None,
+                    Some(submolt.name),
+                    tx,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Fetch one post in full. A search hit carries only a title and a snippet, so the
+/// post detail opens with that and fills in when this arrives.
+fn load_post(api_client: Arc<api::ApiClient>, post_id: String, tx: mpsc::Sender<AppEvent>) {
+    tokio::spawn(async move {
+        match api_client.get_post(&post_id).await {
+            Ok(post) => {
+                let _ = tx.send(AppEvent::PostLoaded(post)).await;
+            }
+            Err(e) => {
+                let _ = tx
+                    .send(AppEvent::Debug(format!("GET /posts/{}: {}", post_id, e)))
                     .await;
             }
         }
@@ -1047,17 +1262,17 @@ fn load_post_with_comments(
 ) {
     tokio::spawn(async move {
         let _ = tx
-            .send(AppEvent::Debug(format!("GET /posts/{}", post_id)))
+            .send(AppEvent::Debug(format!("GET /posts/{}/comments", post_id)))
             .await;
-        match api_client.get_post(&post_id).await {
-            Ok(response) => {
+        match api_client.get_comments(&post_id, MAX_COMMENTS).await {
+            Ok(comments) => {
                 let _ = tx
                     .send(AppEvent::Debug(format!(
-                        "OK: {} comments loaded",
-                        response.comments.len()
+                        "OK: {} top-level comments loaded",
+                        comments.len()
                     )))
                     .await;
-                let _ = tx.send(AppEvent::CommentsLoaded(response.comments)).await;
+                let _ = tx.send(AppEvent::CommentsLoaded(comments)).await;
             }
             Err(e) => {
                 let _ = tx
@@ -1335,5 +1550,139 @@ fn handle_settings_change(app: &mut App, forward: bool) {
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A client pointed at a port nothing listens on: requests the keys trigger fail
+    /// quietly in the background, and the app's own state is what these check.
+    fn harness() -> (
+        App,
+        Arc<api::ApiClient>,
+        mpsc::Sender<AppEvent>,
+        mpsc::Receiver<AppEvent>,
+    ) {
+        let (tx, rx) = mpsc::channel(100);
+        let client = Arc::new(api::ApiClient::new("http://127.0.0.1:9".into(), None));
+        (App::new(), client, tx, rx)
+    }
+
+    fn press(
+        app: &mut App,
+        client: &Arc<api::ApiClient>,
+        tx: &mpsc::Sender<AppEvent>,
+        keys: &[KeyCode],
+    ) {
+        for key in keys {
+            handle_input(app, *key, client.clone(), tx.clone());
+        }
+    }
+
+    fn typed(text: &str) -> Vec<KeyCode> {
+        text.chars().map(KeyCode::Char).collect()
+    }
+
+    #[test]
+    fn slash_opens_search_ready_for_typing_from_any_screen() {
+        let (mut app, c, tx, _rx) = harness();
+        app.screen = Screen::Stats;
+        press(&mut app, &c, &tx, &[KeyCode::Char('/')]);
+        assert_eq!(app.screen, Screen::Search);
+        assert!(app.search_editing);
+    }
+
+    #[test]
+    fn typing_a_query_never_fires_the_shortcuts_its_letters_are_bound_to() {
+        let (mut app, c, tx, _rx) = harness();
+        let sort = app.sort_order;
+        press(&mut app, &c, &tx, &[KeyCode::Char('/')]);
+        press(&mut app, &c, &tx, &typed("quit 1 ? jk nt `8"));
+        assert_eq!(app.search_query, "quit 1 ? jk nt `8");
+        assert_eq!(app.screen, Screen::Search, "1 did not switch screens");
+        assert!(!app.should_quit, "q did not quit");
+        assert!(!app.show_help && !app.show_about && !app.debug_mode);
+        assert_eq!(app.sort_order, sort, "n and t did not re-sort the feed");
+
+        press(&mut app, &c, &tx, &[KeyCode::Backspace, KeyCode::Backspace]);
+        assert_eq!(app.search_query, "quit 1 ? jk nt ");
+    }
+
+    #[test]
+    fn tab_while_typing_changes_the_result_type() {
+        let (mut app, c, tx, _rx) = harness();
+        press(
+            &mut app,
+            &c,
+            &tx,
+            &[KeyCode::Char('/'), KeyCode::Tab, KeyCode::Tab],
+        );
+        assert_eq!(app.search_type, SearchType::Comments);
+        assert!(app.search_editing, "still typing");
+    }
+
+    #[test]
+    fn esc_stops_typing_and_a_second_esc_leaves_search() {
+        let (mut app, c, tx, _rx) = harness();
+        app.screen = Screen::Leaderboard;
+        press(&mut app, &c, &tx, &[KeyCode::Char('/')]);
+        press(&mut app, &c, &tx, &typed("abc"));
+        press(&mut app, &c, &tx, &[KeyCode::Esc]);
+        assert_eq!(app.screen, Screen::Search);
+        assert!(!app.search_editing);
+        press(&mut app, &c, &tx, &[KeyCode::Esc]);
+        assert_eq!(app.screen, Screen::Leaderboard);
+    }
+
+    #[test]
+    fn esc_on_an_untouched_search_box_goes_straight_back() {
+        let (mut app, c, tx, _rx) = harness();
+        press(&mut app, &c, &tx, &[KeyCode::Char('/'), KeyCode::Esc]);
+        assert_eq!(app.screen, Screen::Feed);
+    }
+
+    #[test]
+    fn enter_on_an_empty_query_sends_nothing() {
+        let (mut app, c, tx, mut rx) = harness();
+        press(
+            &mut app,
+            &c,
+            &tx,
+            &[KeyCode::Char('/'), KeyCode::Char(' '), KeyCode::Enter],
+        );
+        assert!(app.search_editing && !app.is_loading);
+        assert!(rx.try_recv().is_err(), "no request was started");
+    }
+
+    #[tokio::test]
+    async fn enter_sends_the_query_with_its_type() {
+        let (mut app, c, tx, mut rx) = harness();
+        press(&mut app, &c, &tx, &[KeyCode::Char('/'), KeyCode::Tab]);
+        press(&mut app, &c, &tx, &typed("agent memory"));
+        press(&mut app, &c, &tx, &[KeyCode::Enter]);
+        assert!(app.is_loading && !app.search_editing);
+        assert_eq!(app.search_submitted.as_deref(), Some("agent memory"));
+        match rx.recv().await {
+            Some(AppEvent::Debug(line)) => {
+                assert_eq!(line, "GET /search?q=agent memory&type=posts")
+            }
+            other => panic!("expected the request to be logged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn with_results_showing_letters_are_shortcuts_again() {
+        let (mut app, c, tx, _rx) = harness();
+        app.screen = Screen::Search;
+        app.search_results =
+            serde_json::from_str::<serde_json::Value>(include_str!("api/fixtures/search.json"))
+                .map(|v| serde_json::from_value(v["results"].clone()).unwrap())
+                .unwrap();
+        press(&mut app, &c, &tx, &[KeyCode::Char('j'), KeyCode::Char('j')]);
+        assert_eq!(app.search_selected, 2);
+        press(&mut app, &c, &tx, &[KeyCode::Char('/')]);
+        assert!(app.search_editing, "/ goes back to editing the query");
     }
 }

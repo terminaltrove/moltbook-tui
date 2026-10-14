@@ -127,6 +127,8 @@ pub fn render_nav_tabs_line(current_screen: Screen) -> Line<'static> {
         make_tab('7', "Settings", Screen::Settings),
         Span::raw("  "),
         Span::styled(" [8] About ", Style::default().fg(Color::DarkGray)),
+        Span::raw("  "),
+        make_tab('/', "Search", Screen::Search),
     ])
 }
 

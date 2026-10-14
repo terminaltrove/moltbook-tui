@@ -69,9 +69,9 @@ fn get_header_height(app: &App) -> u16 {
 }
 
 /// Navigation action from clicking tabs
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum NavAction {
-    Screen(u8), // 1-8 for screen numbers
+    Screen(u8), // 1-8 for screen numbers, 9 for Search
     Sort(SortOrder),
     TimeFilter(TimeFilter),
     Shuffle,
@@ -86,36 +86,40 @@ fn get_nav_tab_at_position(x: u16, y: u16, current_screen: &Screen) -> Option<Na
     // Shared header nav tabs line is at y=9 (inside the header box)
     // The actual y position depends on the border, so line 9 corresponds to y=9
 
-    // Nav tabs format: " [1] Feed  [2] Leaderboard  [3] Top Pairings  [4] Agents  [5] Submolts  [6] Stats  [7] Settings  [8] About "
-    // Approximate x positions for each tab (accounting for the format " [X] Label  "):
-    // [1] Feed:        x = 1-11
-    // [2] Leaderboard: x = 13-30
-    // [3] Top Pairings: x = 32-51
-    // [4] Agents:      x = 53-66
-    // [5] Submolts:    x = 68-83
-    // [6] Stats:       x = 85-97
-    // [7] Settings:    x = 99-115
-    // [8] About:       x = 117+
+    // Nav tabs format: " [1] Feed  [2] Leaderboard  [3] Top Pairings  [4] Agents  [5] Submolts  [6] Stats  [7] Settings  [8] About  [/] Search "
+    // Columns of each " [X] Label " as render_nav_tabs_line draws it, after the box border.
+    // Recompute these if a tab is added, renamed or reordered.
+    // [1] Feed:         x = 2-11
+    // [2] Leaderboard:  x = 14-30
+    // [3] Top Pairings: x = 33-50
+    // [4] Agents:       x = 53-64
+    // [5] Submolts:     x = 67-80
+    // [6] Stats:        x = 83-93
+    // [7] Settings:     x = 96-109
+    // [8] About:        x = 112-122
+    // [/] Search:       x = 125-136 (screen number 9)
 
     // The nav tabs line is at y=9 within the header (0-indexed from top of terminal)
     if y == 9 {
         // Check each tab range
-        if (1..=11).contains(&x) {
+        if (2..=11).contains(&x) {
             return Some(NavAction::Screen(1));
-        } else if (13..=30).contains(&x) {
+        } else if (14..=30).contains(&x) {
             return Some(NavAction::Screen(2));
-        } else if (32..=51).contains(&x) {
+        } else if (33..=50).contains(&x) {
             return Some(NavAction::Screen(3));
-        } else if (53..=66).contains(&x) {
+        } else if (53..=64).contains(&x) {
             return Some(NavAction::Screen(4));
-        } else if (68..=83).contains(&x) {
+        } else if (67..=80).contains(&x) {
             return Some(NavAction::Screen(5));
-        } else if (85..=97).contains(&x) {
+        } else if (83..=93).contains(&x) {
             return Some(NavAction::Screen(6));
-        } else if (99..=115).contains(&x) {
+        } else if (96..=109).contains(&x) {
             return Some(NavAction::Screen(7));
-        } else if x >= 117 {
+        } else if (112..=122).contains(&x) {
             return Some(NavAction::Screen(8));
+        } else if (125..=136).contains(&x) {
+            return Some(NavAction::Screen(9));
         }
     }
 
@@ -256,6 +260,10 @@ fn handle_screen_switch(
         }
         8 => {
             app.toggle_about();
+        }
+        9 => {
+            app.add_debug("-> Search (click)".to_string());
+            app.open_search();
         }
         _ => {}
     }
@@ -483,19 +491,22 @@ const POSTS_LIMIT: i64 = 25;
 fn load_posts(app: &App, api_client: Arc<ApiClient>, tx: mpsc::Sender<AppEvent>) {
     let sort = app.sort_order;
     let time_filter = app.time_filter_for_api();
-    let offset = app.current_page as i64 * POSTS_LIMIT;
+    let cursor = app.page_cursor();
     let submolt = app.current_submolt.as_ref().map(|s| s.name.clone());
 
     tokio::spawn(async move {
         let submolt_str = submolt.as_deref();
         match api_client
-            .get_posts(sort, time_filter, POSTS_LIMIT, offset, submolt_str)
+            .get_posts(sort, time_filter, POSTS_LIMIT, cursor.as_deref(), submolt_str)
             .await
         {
             Ok(response) => {
-                let has_more = response.posts.len() as i64 == POSTS_LIMIT;
                 let _ = tx
-                    .send(AppEvent::PostsLoaded(response.posts, has_more))
+                    .send(AppEvent::PostsLoaded(
+                        response.posts,
+                        response.has_more,
+                        response.next_cursor,
+                    ))
                     .await;
             }
             Err(e) => {
@@ -589,4 +600,47 @@ fn load_stats(api_client: Arc<ApiClient>, tx: mpsc::Sender<AppEvent>) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::header::render_nav_tabs_line;
+
+    /// Every column of every tab, as `render_nav_tabs_line` actually draws them, must
+    /// click through to that tab. These ranges are hand-kept and had drifted by up to
+    /// five columns; this is what notices next time.
+    #[test]
+    fn every_drawn_nav_tab_is_clickable_across_its_whole_width() {
+        let line = render_nav_tabs_line(Screen::Feed);
+        let mut x = 1; // the header box's left border
+        let mut tabs = 0;
+        for span in &line.spans {
+            let text = span.content.as_ref();
+            let width = text.chars().count() as u16;
+            if let Some(key) = text.trim().strip_prefix('[').and_then(|t| t.chars().next()) {
+                let screen = match key {
+                    '/' => 9,
+                    k => k.to_digit(10).unwrap() as u8,
+                };
+                for col in x..x + width {
+                    assert_eq!(
+                        get_nav_tab_at_position(col, 9, &Screen::Feed),
+                        Some(NavAction::Screen(screen)),
+                        "column {col} is inside {text:?}"
+                    );
+                }
+                tabs += 1;
+            }
+            x += width;
+        }
+        assert_eq!(tabs, 9, "eight screens and Search");
+    }
+
+    #[test]
+    fn the_gaps_between_tabs_click_nothing() {
+        for col in [12, 13, 31, 32, 51, 52, 123, 124] {
+            assert_eq!(get_nav_tab_at_position(col, 9, &Screen::Feed), None, "column {col}");
+        }
+    }
 }

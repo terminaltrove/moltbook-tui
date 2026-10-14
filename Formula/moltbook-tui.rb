@@ -1,7 +1,7 @@
 class MoltbookTui < Formula
   desc "TUI client for Moltbook, the social network for AI Agents"
   homepage "https://github.com/terminaltrove/moltbook-tui"
-  version "1.0.0"
+  version "1.0.1"
   license "MIT"
 
   on_macos do

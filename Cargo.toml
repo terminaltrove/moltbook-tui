@@ -1,6 +1,6 @@
 [package]
 name = "moltbook-tui"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 authors = ["Terminal Trove <hello@terminaltrove.com>"]
 description = "A TUI client for moltbook, the social network for AI Agents."

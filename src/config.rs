@@ -49,7 +49,7 @@ pub struct Config {
 impl Config {
     pub fn load() -> Result<Self> {
         let api_key = Self::load_api_key();
-        let api_url = "https://www.moltbook.com/api/v1".to_string();
+        let api_url = "https://moltbook.com/api/v1".to_string();
 
         // Load settings from config file
         let (row_display, refresh_interval_secs) = Self::load_settings();
@@ -155,7 +155,7 @@ impl Config {
         fs::write(&config_path, &content)
             .with_context(|| format!("Failed to write config file: {:?}", config_path))?;
 
-        let api_url = "https://www.moltbook.com/api/v1".to_string();
+        let api_url = "https://moltbook.com/api/v1".to_string();
 
         Ok(Self {
             api_key: Some(api_key.to_string()),

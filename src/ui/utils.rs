@@ -171,3 +171,77 @@ pub fn parse_simple_markdown(text: &str) -> Vec<Span<'static>> {
     }
     spans
 }
+
+const HL_OPEN: &str = "⟦HL⟧";
+const HL_CLOSE: &str = "⟦/HL⟧";
+
+/// Split a search snippet into spans, styling what the server wrapped in
+/// `⟦HL⟧…⟦/HL⟧`. Line breaks become spaces, and the visible text stops at
+/// `max_chars` with an ellipsis.
+pub fn highlight_spans(text: &str, max_chars: usize, base: Style, hl: Style) -> Vec<Span<'static>> {
+    let flat: String = text
+        .chars()
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
+        .collect();
+    let mut spans = Vec::new();
+    let mut budget = max_chars;
+    let mut rest = flat.as_str();
+    let mut inside = false;
+    while !rest.is_empty() && budget > 0 {
+        let marker = if inside { HL_CLOSE } else { HL_OPEN };
+        let (segment, after) = match rest.find(marker) {
+            Some(i) => (&rest[..i], &rest[i + marker.len()..]),
+            None => (rest, ""),
+        };
+        let count = segment.chars().count();
+        let style = if inside { hl } else { base };
+        if count > budget {
+            let cut: String = segment.chars().take(budget.saturating_sub(1)).collect();
+            spans.push(Span::styled(cut + "…", style));
+            break;
+        }
+        if count > 0 {
+            spans.push(Span::styled(segment.to_string(), style));
+        }
+        budget -= count;
+        rest = after;
+        inside = !inside;
+    }
+    spans
+}
+
+/// The snippet's text without the server's highlight markers.
+pub fn strip_highlights(text: &str) -> String {
+    text.replace(HL_OPEN, "").replace(HL_CLOSE, "")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text(spans: &[Span]) -> String {
+        spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn highlights_become_their_own_spans() {
+        let hl = Style::default().add_modifier(Modifier::BOLD);
+        let spans = highlight_spans("an ⟦HL⟧agent⟦/HL⟧ said", 100, Style::default(), hl);
+        assert_eq!(text(&spans), "an agent said");
+        assert_eq!(spans[1].content, "agent");
+        assert_eq!(spans[1].style, hl);
+    }
+
+    #[test]
+    fn long_snippets_are_cut_with_an_ellipsis() {
+        let spans = highlight_spans("⟦HL⟧abcdef⟦/HL⟧ghij", 5, Style::default(), Style::default());
+        assert_eq!(text(&spans), "abcd…");
+    }
+
+    #[test]
+    fn line_breaks_flatten_and_markers_strip() {
+        let spans = highlight_spans("one\ntwo", 50, Style::default(), Style::default());
+        assert_eq!(text(&spans), "one two");
+        assert_eq!(strip_highlights("a ⟦HL⟧b⟦/HL⟧"), "a b");
+    }
+}

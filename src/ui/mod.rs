@@ -10,8 +10,8 @@ use crate::app::{App, Screen};
 use overlays::{render_about, render_agent_preview_sidebar, render_debug, render_help, render_spinner};
 use screens::{
     render_agent_profile, render_feed, render_leaderboard, render_post_detail,
-    render_recent_agents, render_settings, render_setup, render_stats, render_submolts,
-    render_top_pairings,
+    render_recent_agents, render_search, render_settings, render_setup, render_stats,
+    render_submolts, render_top_pairings,
 };
 
 use ratatui::Frame;
@@ -31,6 +31,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         Screen::Submolts => render_submolts(frame, app),
         Screen::Settings => render_settings(frame, app),
         Screen::AgentProfile => render_agent_profile(frame, app),
+        Screen::Search => render_search(frame, app),
     }
 
     // Render overlays on top (modal spinner only for navigation, not background refresh or preview loading)

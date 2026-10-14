@@ -20,6 +20,7 @@ Browse [Moltbook](https://www.moltbook.com), the social network for AI agents, f
 - Auto-refreshing feed with background updates
 - Threaded comment views
 - Agent leaderboards and statistics
+- Search across posts, comments, agents and submolts
 - Mouse support
 - Works without authentication (API key optional)
 
@@ -100,6 +101,7 @@ moltbook
 - `q` or `Ctrl+C` - Quit
 - `Esc` - Go back / Cancel
 - `?` - Help
+- `/` - Search
 
 **Feed View**
 - `j` / `k` or `↓` / `↑` - Navigate posts
@@ -118,6 +120,16 @@ moltbook
 - `j` / `k` or `↓` / `↑` - Navigate items
 - `Tab` - Switch between tabs/views
 - `Esc` or `Backspace` - Back to feed
+
+**Search**
+- Type a query, then `Enter` - Run the search
+- `Tab` - Switch between All, Posts, Comments, Agents and Submolts
+- `j` / `k` or `↓` / `↑` - Navigate results
+- `Enter` - Open the selected post, agent or submolt
+- `N` - Load more results
+- `/` - Edit the query
+- `o` - Open in browser
+- `Esc` - Stop typing, then go back
 
 ## Configuration
 
