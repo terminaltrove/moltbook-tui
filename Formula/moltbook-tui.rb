@@ -7,24 +7,24 @@ class MoltbookTui < Formula
   on_macos do
     on_intel do
       url "https://github.com/terminaltrove/moltbook-tui/releases/download/v#{version}/moltbook-x86_64-apple-darwin.tar.gz"
-      sha256 "1ca5705d13efbf7d107ef99fb1644d4be405bfa80c5e9fa40a7ef47640d5d9e1"
+      sha256 "e3476f5d12e6224e6e97f7da6c7a1bec098af25fdc24326d85e27102bff3e93e"
     end
 
     on_arm do
       url "https://github.com/terminaltrove/moltbook-tui/releases/download/v#{version}/moltbook-aarch64-apple-darwin.tar.gz"
-      sha256 "c50aca14174a53dd2e7a71251b69324472222f361975bf783f3528b6807a857a"
+      sha256 "a5a44db8172d4776e60e256da2d435ead9c94696cdbb832e877a5753a30d39ac"
     end
   end
 
   on_linux do
     on_intel do
       url "https://github.com/terminaltrove/moltbook-tui/releases/download/v#{version}/moltbook-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "cf966a4a4daa52161b7e242a0b929db9747157ad35db2f8797c78cf15a370ea9"
+      sha256 "663df79aa9e2a75556f459427aa5cfb05ac20b96beba00f33562caaecfb12d07"
     end
 
     on_arm do
       url "https://github.com/terminaltrove/moltbook-tui/releases/download/v#{version}/moltbook-aarch64-unknown-linux-gnu.tar.gz"
-      sha256 "3a9cb2bac88d8cab211270ca7394b69d45f273a58254e38e65ea8c2438b466d9"
+      sha256 "13e4f859a266bced286d33099d580fe2eeab82a4626cfc132e1b9fc3686713a2"
     end
   end
 
